@@ -53,3 +53,10 @@ rl_camera :: proc(c: ^Camera) -> rl.Camera2D {
 	w, h := f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())
 	return {offset = {w / 2, h / 2}, target = {c.pos.x, c.pos.y}, zoom = h / (GAME_HEIGHT * c.zoom)}
 }
+
+// The view's size in the world: its height, and its width by the window's shape.
+view_size :: proc(c: ^Camera) -> sim.Vec2 {
+	w, h := f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())
+	view_h := GAME_HEIGHT * c.zoom
+	return {view_h * w / h, view_h}
+}

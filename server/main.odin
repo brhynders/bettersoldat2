@@ -4,8 +4,8 @@
 //   while running:
 //     receive client messages
 //     tick accumulator:
-//       tick (one command per client, the world stepped, the hits applied)
-//       send snapshots
+//       tick            everyone stepped on their keys, the hits applied, the deaths told
+//       send            the snapshots, deltas, tally, things and pings on their schedules
 //     sleep until the next tick
 //   cleanup
 package server
@@ -30,7 +30,6 @@ Options :: struct {
 	base:     string,
 	map_name: string,
 	port:     u16,
-	max_rewind_ms: int, // how far back a shot is judged at most (0: not at all, shooters lead)
 	bots:     int,  // played by the server itself, from the start
 	dodge:    bool, // the bots change direction and jet at random in a fight, as a person does
 }
@@ -47,8 +46,7 @@ init :: proc() {
 	server.options = parse_options()
 	o := &server.options
 	host_open(&server.host, o.port)
-	game_init(&server.game, o.base, o.map_name, u32(o.max_rewind_ms * sim.TICK_RATE / 1000))
-	for _ in 0 ..< o.bots do add_bot(&server.game, o.dodge)
+	game_init(&server.game, o.base, o.map_name, o.bots, o.dodge)
 	server.last = time.tick_now()
 }
 
@@ -58,8 +56,8 @@ server_loop :: proc() {
 	server.accumulator += time.duration_seconds(time.tick_diff(server.last, now))
 	server.last = now
 	for server.accumulator >= TICK {
-		tick(&server.game)
-		send_snapshots(&server.game, &server.host)
+		tick(&server.game, &server.host)
+		send_all_scheduled(&server.game, &server.host)
 		server.accumulator -= TICK
 	}
 	time.sleep(time.Millisecond)
@@ -73,7 +71,6 @@ parse_options :: proc() -> (o: Options) {
 	o.base = "../opensoldat-base/shared"
 	o.map_name = "ctf_Ash"
 	o.port = 23073
-	o.max_rewind_ms = 150
 	args := os.args[1:]
 	for i := 0; i < len(args); i += 1 {
 		next := i + 1 < len(args) ? args[i + 1] : ""
@@ -81,7 +78,6 @@ parse_options :: proc() -> (o: Options) {
 		case "-base": o.base = next; i += 1
 		case "-map":  o.map_name = next; i += 1
 		case "-port": o.port = u16(strconv.parse_int(next) or_else 23073); i += 1
-		case "-max-rewind": o.max_rewind_ms = strconv.parse_int(next) or_else 150; i += 1
 		case "-bots":  o.bots = strconv.parse_int(next) or_else 0; i += 1
 		case "-dodge": o.dodge = true
 		}

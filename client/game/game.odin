@@ -5,76 +5,68 @@ import "../input"
 import "../../shared/net"
 import "../../shared/sim"
 
-// The game as this client plays it. One world, rebuilt every tick by one rule:
-//
-//   the world is the server's newest snapshot, with everything that is not mine as
-//     it is shown: a few ticks behind, blended between the two snapshots around the
-//     render tick;
-//   my pending commands are replayed on it, stepping the whole world, which predicts
-//     everything they touch; my shots meet the others where I see them, as the server
-//     will judge them (it rewinds to the tick I show);
-//   everything that is not mine is put back as it is shown, for the replay stepped
-//     their bullets and things on too;
-//   the corpses step, and the effects are gathered: mine from my replay, the rest
-//     from the server as the render clock reaches their tick.
-//
-// Mine is what my commands can change: my soldier, the bullets I fired, the things I
-// hold or let go of (`mine`). Everything else is the server's word, shown late enough
-// that the next snapshot is always there to blend toward, so it is never guessed and
-// never corrected. Nothing is kept across ticks but the pending commands, the corpses
-// and the events waiting for the render clock.
-//
-// The game owns what the sim reads and never writes (the map, the animations, the
-// weapons, the things' skeletons), loaded for the map the server named.
+// The game as OpenSoldat's client plays it (ClientGame.pas, UpdateFrame.pas,
+// NetworkClient*.pas). One world, stepped every tick: my soldier on my keys, everyone
+// else on the last keys the server relayed of them (dead reckoning: the whole movement
+// code, so they keep running, jumping and jetting as they were), every bullet, every
+// thing. What the server says of the others lands as it comes: a snapshot or a delta
+// puts a soldier where the server has it, no blending. Of my own soldier the server's
+// word is only my health, my vest and my grenades; where I am is mine to say, and I
+// say it every few ticks. I wound nobody: the hits I see are blood and a shove, and
+// the wound comes back in a snapshot. A slow weapon's shot comes as a bullet that is
+// flown on by my ping and its shooter's; a fast weapon's I make from their Fire key.
 Game :: struct {
 	ctx:       sim.Context,
 	level:     sim.Level,
 	anims:     ^sim.Anims,
 	skeletons: ^sim.Skeletons,
-	world:   sim.World,
-	me:      u8,
-	seq:     u32, // my command count
-	pending: [dynamic]sim.Command, // not yet applied by the server, oldest first
-	snaps:   Snapshots,
-	shown:   ^net.Snapshot, // scratch: the world at the render tick
+	world:     sim.World,
+	history:   sim.History, // where everyone was, so a relayed bullet meets them as its shooter saw them
+	me:        u8,
+	events:    sim.Events, // this tick's, for the sparks and sounds
+	others:    [sim.MAX_PLAYERS]sim.Command, // the last keys and aim heard of each: what they are stepped on
 
-	events:    sim.Events, // this tick's effects
-	frontier:  sim.Events, // scratch: what the newest command's step produced
-	timeline:  [dynamic]net.Timed_Event, // the server's events, until the render clock reaches their tick
-	next_fact: u32, // the server's decisions come numbered: the next to take
+	// the clock and the line
+	client_ticks:  i32, // the server's tick as last told, counted on (ClientTickCount)
+	last_told:     i32, // the newest server tick a snapshot named: an older delta is stale
+	stop_moving:   int, // ticks left before the world freezes for want of a ping (ClientStopMovingCounter)
+	heartbeat_at:  u32, // when the last heartbeat came
+	had_heartbeat: bool,
+	players:       int, // for the packet-rate scale
 
-	time_scale:  f64, // my tick rate against the server's, steering the queue depth
-	shots_fired: int,      // ours, for the HUD
-	hits_predicted, hits_confirmed: int, // my hits as I saw them, and as the server ruled
-	my_prev:     sim.Vec2, // my position a tick ago, for drawing between ticks
+	// what I last sent, for the change gates
+	old_snapshot: net.Client_Sprite_Snapshot,
+	old_mov:      net.Client_Sprite_Snapshot_Mov, // its aim is the mouse on the screen, as the original keeps it
+	force_mov:    bool, // a fast weapon fired: the next movement packet goes at once
+	last_force:   u32,
+	sent_seed:    u16,  // my newest shot sent: one message per shot, whatever its pellets
 
-	// a correction: the server put my soldier elsewhere than I predicted for the same
-	// command; the difference is drawn as an offset that blends out
-	predicted: [PREDICTED_KEPT]sim.Vec2, // my position after each command, by seq
-	checked:   u32,      // the newest ack compared
-	smooth:    sim.Vec2, // the drawn offset
+	prev:        [sim.MAX_PLAYERS]sim.Vec2, // where each soldier was before the newest tick, for drawing between ticks
+	shots_fired: int,
+	hits_seen:   int, // my bullets meeting an enemy, as I saw them
+	writer:      net.Writer,
 }
 
-PREDICTED_KEPT :: 64
-SMOOTH_DECAY   :: 0.8  // share of the offset kept per tick
-SMOOTH_SNAP    :: 60.0 // a correction this large is shown at once
-
-// The sim's data for the map, read from `base`, and an empty world for slot `me`.
-init :: proc(g: ^Game, base, map_name: string, me: u8, interp_ticks: int) -> bool {
+// The sim's data for the map, and the world as the welcome describes it: everyone
+// playing is there, dead until their first snapshot puts them somewhere.
+init :: proc(g: ^Game, base: string, welcome: ^net.Welcome) -> bool {
 	ok: bool
-	if g.level, ok = sim.level_load_file(base, map_name); !ok do return false
+	if g.level, ok = sim.level_load_file(base, welcome.map_name); !ok do return false
 	if g.anims, ok = sim.anims_load_files(base); !ok do return false
 	if g.skeletons, ok = sim.skeletons_load_files(base); !ok do return false
 	g.ctx.level = &g.level
 	g.ctx.anims = g.anims
 	g.ctx.skeletons = g.skeletons
 	sim.weapons_default(&g.ctx.weapons)
-	g.me = me
 	sim.world_init(&g.world, 0)
 	sim.round_init(&g.world.round)
-	snapshots_init(&g.snaps, interp_ticks)
-	g.shown = new(net.Snapshot)
-	g.time_scale = 1
+	g.me = welcome.slot
+	g.world.net.mine = {int(g.me)}
+	g.world.history = &g.history
+	g.client_ticks = welcome.server_ticks
+	g.world.tick = u32(welcome.server_ticks)
+	for team, i in welcome.teams do if team != .None do player_appears(g, u8(i), team)
+	g.stop_moving = net.CLIENT_STOP_MOVE_RETRYS
 	return true
 }
 
@@ -82,171 +74,406 @@ destroy :: proc(g: ^Game) {
 	sim.level_destroy(&g.level)
 	free(g.anims)
 	free(g.skeletons)
-	delete(g.pending)
-	delete(g.timeline)
-	free(g.shown)
-	snapshots_destroy(&g.snaps)
 }
 
-// ---- what is mine ----
-
-@(private)
-mine_soldier :: proc(g: ^Game, slot: int) -> bool { return u8(slot) == g.me }
-mine_bullet  :: proc(g: ^Game, b: ^sim.Bullet) -> bool { return b.active && b.owner == g.me }
-mine_thing   :: proc(g: ^Game, t: ^sim.Thing) -> bool { return t.style != .None && (t.holder == g.me + 1 || t.owner == g.me + 1) }
-
-// An action of mine, which my replay produced; the server's copy is skipped.
-@(private)
-mine_event :: proc(g: ^Game, e: sim.Event) -> bool {
-	owner, action := sim.event_owner(e)
-	return action && owner == g.me
-}
-
-// ---- receiving ----
-
-// Every snapshot that arrived since the last tick. Its ack retires my commands and
-// checks my prediction; its queue depth sets my clock: slower with too many waiting,
-// faster with too few, and exactly the server's when the queue is near the target,
-// so ticks and frames keep step. Its events wait for the render clock.
-receive :: proc(g: ^Game, conn: ^connection.Connection) {
-	for data in connection.receive(conn) {
-		r := net.reader_make(data)
-		if net.Msg(net.read_u8(&r)) != .Snapshot do continue
-		snap := snapshots_receive(&g.snaps, &r)
-		if snap == nil do continue
-		for len(g.pending) > 0 && g.pending[0].seq <= snap.ack do ordered_remove(&g.pending, 0)
-		if snap.ack > g.checked && snap.ack + PREDICTED_KEPT > g.seq {
-			g.smooth += g.predicted[snap.ack % PREDICTED_KEPT] - snap.soldiers[g.me].pos
-			if sim.vec2_length(g.smooth) > SMOOTH_SNAP do g.smooth = {}
-			g.checked = snap.ack
-		}
-		depth := int(snap.queue_depth)
-		g.time_scale = depth < TARGET_QUEUE - 1 ? 1.02 : depth > TARGET_QUEUE + 1 ? 0.98 : 1
-		for e in sim.events_slice(&snap.events) do append(&g.timeline, net.Timed_Event{tick = snap.tick, e = e})
-		for f in snap.facts[:snap.fact_count] {
-			if f.seq < g.next_fact do continue // carried again until acknowledged: had it
-			append(&g.timeline, f)
-			g.next_fact = f.seq + 1
-		}
-	}
+// A soldier that is playing but not yet placed: dead, so its first snapshot revives it.
+player_appears :: proc(g: ^Game, slot: u8, team: sim.Team) {
+	s := &g.world.soldiers[slot]
+	sim.soldier_spawn(&g.ctx, s, {}, team, .AK74, .Colt)
+	s.dead = true
+	g.players += 1
 }
 
 // ---- the tick ----
 
-simulate :: proc(g: ^Game, in_: ^input.Input) {
-	g.seq += 1
-	append(&g.pending, input.command(in_, g.seq))
-	latest := snapshots_latest(&g.snaps)
-	if latest == nil do return
-
-	g.my_prev = g.world.soldiers[g.me].pos
-	world_reset(&g.world, latest)
-	snapshots_advance(&g.snaps)
-	shown := snapshots_shown(&g.snaps, g.shown)
-	if shown do overlay(g, g.shown)
-	replay(g)
-	if shown do overlay(g, g.shown)
-	sim.ragdolls_update(&g.ctx, &g.world)
-	gather_effects(g)
-	g.smooth *= SMOOTH_DECAY
-}
-
-// The authoritative state over the world; the corpses and the rng are the client's own.
-@(private)
-world_reset :: proc(w: ^sim.World, snap: ^net.Snapshot) {
-	w.tick = snap.tick
-	w.round = snap.round
-	w.soldiers = snap.soldiers
-	w.things = snap.things
-	w.bullets = snap.bullets
-}
-
-// My pending commands, oldest first, each a tick of my soldier, the things and the
-// bullets: the sim as it is. Only the newest command's step is new this tick; its
-// events are kept, the rest are re-runs of earlier ticks and theirs are thrown away.
-@(private)
-replay :: proc(g: ^Game) {
-	scratch: sim.Events
-	for cmd, i in g.pending {
-		events := i == len(g.pending) - 1 ? &g.frontier : &scratch
-		sim.events_clear(events)
-		sim.soldier_step(&g.ctx, &g.world, g.me, cmd, events)
-		g.predicted[cmd.seq % PREDICTED_KEPT] = g.world.soldiers[g.me].pos
-		sim.things_update(&g.ctx, &g.world, events)
-		sim.bullets_update(&g.ctx, &g.world, events)
-		g.world.tick += 1 // the tick the server will run this command on
-	}
-}
-
-// Everything that is not mine, as the shown world has it. What the shown world holds
-// of mine is my own past, and my replay has the present of it: dropped.
-@(private)
-overlay :: proc(g: ^Game, shown: ^net.Snapshot) {
+// Everyone stepped on their keys, then the things, the bullets and the corpses; and
+// where everyone was, recorded. With the pings stopped, nothing moves (the original's
+// ClientStopMovingCounter). `view` is my camera and `view_half` half my view, for the
+// rules that go by what I can see.
+simulate :: proc(g: ^Game, in_: ^input.Input, view, view_half: sim.Vec2) {
 	w := &g.world
-	for i in 0 ..< sim.MAX_PLAYERS {
-		if !mine_soldier(g, i) do w.soldiers[i] = shown.soldiers[i]
-	}
-	for &t, i in w.things {
-		if !mine_thing(g, &t) do t = mine_thing(g, &shown.things[i]) ? {} : shown.things[i]
-	}
-	for &b, i in w.bullets {
-		if !mine_bullet(g, &b) do b = mine_bullet(g, &shown.bullets[i]) ? {} : shown.bullets[i]
-	}
-}
-
-// This tick's effects for the sparks and sounds: my actions from my replay, and from
-// the server everything the render clock has reached, except my actions again.
-@(private)
-gather_effects :: proc(g: ^Game) {
+	w.net.view, w.net.view_half = view, view_half
 	sim.events_clear(&g.events)
-	for e in sim.events_slice(&g.frontier) {
-		if mine_event(g, e) do sim.emit(&g.events, e)
-	}
-	now := u32(g.snaps.render_tick)
-	for i := 0; i < len(g.timeline); {
-		te := g.timeline[i]
-		if te.tick > now {
-			i += 1
-			continue
+	if g.stop_moving > 0 do g.stop_moving -= 1
+	if g.had_heartbeat && w.tick - g.heartbeat_at > net.CONNECTION_PROBLEM_TIME do g.stop_moving = 0
+
+	mine := input.command(in_, 0)
+	for &s, i in w.soldiers do g.prev[i] = s.pos
+	if g.stop_moving > 0 {
+		for &s, i in w.soldiers {
+			if !s.active || s.dead do continue
+			sim.soldier_step(&g.ctx, w, u8(i), u8(i) == g.me ? mine : g.others[i], &g.events)
 		}
-		if !mine_event(g, te.e) do sim.emit(&g.events, te.e)
-		ordered_remove(&g.timeline, i)
+		sim.things_update(&g.ctx, w, &g.events)
+		sim.bullets_update(&g.ctx, w, &g.events)
 	}
-	// the counts the debug summary shows: what I predicted against what the server ruled
-	for e in sim.events_slice(&g.frontier) {
-		if v, is_hit := e.(sim.Hit); is_hit && v.shooter == g.me && wounds(g, v.target) do g.hits_predicted += 1
-	}
+	sim.ragdolls_update(&g.ctx, w)
+	sim.history_record(&g.history, w)
+	w.tick += 1
+	g.client_ticks += 1
+
 	for e in sim.events_slice(&g.events) {
 		#partial switch v in e {
-		case sim.Fire:   if v.player == g.me do g.shots_fired += 1
-		case sim.Damage: if v.attacker == g.me && v.target != g.me do g.hits_confirmed += 1
+		case sim.Fire:
+			if v.player != g.me do continue
+			g.shots_fired += 1
+			// a fast weapon's shot is not sent: the next movement packet goes at once instead
+			if g.ctx.weapons[v.weapon].fire_interval <= sim.FIRE_INTERVAL_NET && w.tick > g.last_force + sim.FIRE_INTERVAL_NET {
+				g.force_mov = true
+				g.last_force = w.tick
+			}
+		case sim.Hit:
+			if v.shooter == g.me && v.target != g.me && w.soldiers[v.target].team != w.soldiers[g.me].team do g.hits_seen += 1
 		}
 	}
-}
-
-// Whether my hit on `target` would wound it: another soldier, and on the other team
-// unless friendly fire is on (damage_apply's rule).
-@(private)
-wounds :: proc(g: ^Game, target: u8) -> bool {
-	if target == g.me do return false
-	me, them := &g.world.soldiers[g.me], &g.world.soldiers[target]
-	return g.world.round.friendly_fire || me.team == .None || me.team != them.team
 }
 
 // ---- sending ----
 
-// My newest commands, a few packets running so a lost one loses nothing, and the tick
-// I show the others at.
-send :: proc(g: ^Game, conn: ^connection.Connection) {
-	m := net.Input{view_tick = u32(g.snaps.render_tick), have = g.snaps.any ? g.snaps.latest : 0}
-	first := max(len(g.pending) - net.MAX_COMMANDS_PER_INPUT, 0)
-	for cmd in g.pending[first:] {
-		m.commands[m.count] = cmd
-		m.count += 1
+// On the schedules of ClientGame.pas: what I hold every seven ticks or so when it
+// changed, where I am every five when it changed enough, that I am dead every thirty;
+// and each slow weapon's shot as it leaves.
+send :: proc(g: ^Game, conn: ^connection.Connection, in_: ^input.Input, mouse: sim.Vec2) {
+	w := &g.world
+	me := &w.soldiers[g.me]
+	a := net.client_adjust(g.players)
+	tick := w.tick
+	if me.active && !me.dead {
+		if net.due(tick, 7, a, 1) && !net.due(tick, 5, a) do send_snapshot(g, conn)
+		if net.due(tick, 5, a) || g.force_mov {
+			send_movement(g, conn, in_, mouse)
+			g.force_mov = false
+		}
+	} else if me.active && net.due(tick, 30, a) {
+		m := net.Client_Sprite_Snapshot_Dead{camera_focus = g.me}
+		send_msg(g, conn, .Client_Sprite_Snapshot_Dead, &m)
 	}
-	w: net.Writer
-	net.encode_input(&w, &m)
-	connection.send(conn, net.writer_bytes(&w), reliable = false)
+	for e in sim.events_slice(&g.events) {
+		v, is_spawn := e.(sim.Bullet_Spawn)
+		if !is_spawn || v.player != g.me || g.stop_moving <= 0 do continue
+		b := &w.bullets[v.id]
+		info := &g.ctx.weapons[v.weapon]
+		if b.seed == g.sent_seed do continue // a pellet of a shot already sent
+		if info.fire_interval <= sim.FIRE_INTERVAL_NET && b.style != .Frag_Grenade && b.style != .Cluster_Nade do continue
+		g.sent_seed = b.seed
+		m := net.Client_Bullet_Snapshot{weapon = v.weapon, pos = v.pos, vel = v.vel, seed = b.seed, client_ticks = g.client_ticks}
+		send_msg(g, conn, .Bullet_Snapshot, &m)
+	}
+}
+
+send_snapshot :: proc(g: ^Game, conn: ^connection.Connection) {
+	me := &g.world.soldiers[g.me]
+	m := net.Client_Sprite_Snapshot{
+		ammo = u8(clamp(me.weapon.ammo, 0, 255)), secondary_ammo = u8(clamp(me.secondary.ammo, 0, 255)),
+		weapon = me.weapon.id, secondary_weapon = me.secondary.id, position = me.stance,
+	}
+	old := &g.old_snapshot
+	if m.ammo == old.ammo && m.weapon == old.weapon && m.secondary_weapon == old.secondary_weapon && m.position == old.position do return
+	old^ = m
+	send_msg(g, conn, .Client_Sprite_Snapshot, &m)
+}
+
+// Where I am, when I moved or turned enough since I last said, or my keys changed, or
+// I am jetting (always); the aim's test compares the mouse on the screen with the
+// last one, as the original does, while the aim sent is in the world.
+send_movement :: proc(g: ^Game, conn: ^connection.Connection, in_: ^input.Input, mouse: sim.Vec2) {
+	me := &g.world.soldiers[g.me]
+	x, y := net.aim_out(in_.aim)
+	m := net.Client_Sprite_Snapshot_Mov{pos = me.pos, vel = me.vel, keys = net.encode_keys(in_.held + in_.pressed), aim_x = x, aim_y = y}
+	old := &g.old_mov
+	info := &g.ctx.weapons[me.weapon.id]
+	mx, my := mouse.x, mouse.y
+	ox, oy := f32(old.aim_x), f32(old.aim_y)
+	aim_still := (info.fire_interval <= sim.FIRE_INTERVAL_NET && me.weapon.ammo > 0 && f32(i16(mx + 0.5)) == ox && f32(i16(my + 0.5)) == oy) ||
+		(abs(mx - ox) < net.MOUSE_AIM_DELTA && abs(my - oy) < net.MOUSE_AIM_DELTA)
+	changed := sim.vec2_length(m.pos - old.pos) > net.POS_DELTA || sim.vec2_length(m.vel - old.vel) > net.VEL_DELTA ||
+		m.keys != old.keys || m.keys & net.KEY_JET != 0 || !aim_still
+	if !changed do return
+	old^ = m
+	old.aim_x, old.aim_y = i16(clamp(mx, -32000, 32000)), i16(clamp(my, -32000, 32000)) // the screen's, as the original keeps it
+	send_msg(g, conn, .Client_Sprite_Snapshot_Mov, &m)
+}
+
+send_msg :: proc(g: ^Game, conn: ^connection.Connection, id: net.Msg, m: ^$T) {
+	net.put(&g.writer, id, m)
+	connection.send(conn, net.writer_bytes(&g.writer), net.reliable(id))
+}
+
+// ---- receiving ----
+
+// Everything the server sent since the last tick, in order.
+receive :: proc(g: ^Game, conn: ^connection.Connection) {
+	for data in connection.receive(conn) {
+		r := net.reader_make(data)
+		id := net.Msg(net.read_u8(&r))
+		#partial switch id {
+		case .Server_Sprite_Snapshot:
+			m: net.Server_Sprite_Snapshot
+			if net.get(&r, &m) do receive_snapshot(g, &m)
+		case .Server_Sprite_Snapshot_Major:
+			m: net.Server_Sprite_Snapshot_Major
+			if net.get(&r, &m) do receive_major(g, &m)
+		case .Server_Skeleton_Snapshot:
+			m: net.Server_Skeleton_Snapshot
+			if net.get(&r, &m) && int(m.num) < sim.MAX_PLAYERS {
+				s := &g.world.soldiers[m.num]
+				s.dead = true
+				s.respawn_counter = i32(m.respawn_counter)
+				s.weapon = sim.weapon_state(&g.ctx, .None)
+			}
+		case .Delta_Movement:
+			m: net.Delta_Movement
+			if net.get(&r, &m) do receive_delta_movement(g, &m)
+		case .Delta_Weapons:
+			m: net.Delta_Weapons
+			if net.get(&r, &m) && int(m.num) < sim.MAX_PLAYERS && m.num != g.me do set_weapons(g, m.num, m.weapon, m.secondary_weapon, m.ammo)
+		case .Bullet_Snapshot:
+			m: net.Bullet_Snapshot
+			if net.get(&r, &m) do receive_bullet(g, &m)
+		case .Sprite_Death:
+			m: net.Sprite_Death
+			if net.get(&r, &m) do receive_death(g, &m)
+		case .Heart_Beat:
+			m: net.Heart_Beat
+			if net.get(&r, &m) do receive_heartbeat(g, &m)
+		case .Ping:
+			m: net.Ping
+			if net.get(&r, &m) {
+				g.world.soldiers[g.me].ping_ticks = m.ping_ticks
+				g.stop_moving = net.CLIENT_STOP_MOVE_RETRYS
+				pong := net.Pong{ping_num = m.ping_num}
+				send_msg(g, conn, .Pong, &pong)
+			}
+		case .Server_Thing_Snapshot:
+			m: net.Server_Thing_Snapshot
+			if net.get(&r, &m) do receive_thing(g, &m)
+		case .Server_Thing_Must_Snapshot:
+			m: net.Server_Thing_Must_Snapshot
+			if net.get(&r, &m) do receive_thing_must(g, &m)
+		case .Thing_Taken:
+			m: net.Thing_Taken
+			if net.get(&r, &m) do receive_thing_taken(g, &m)
+		case .Flag_Info:
+			m: net.Flag_Info
+			if net.get(&r, &m) do receive_flag_info(g, &m)
+		case .New_Player:
+			m: net.New_Player
+			if net.get(&r, &m) && int(m.num) < sim.MAX_PLAYERS && !g.world.soldiers[m.num].active do player_appears(g, m.num, m.team)
+		case .Player_Disconnect:
+			m: net.Player_Disconnect
+			if net.get(&r, &m) && int(m.num) < sim.MAX_PLAYERS {
+				g.world.soldiers[m.num].active = false
+				g.players = max(g.players - 1, 0)
+			}
+		}
+	}
+}
+
+// A soldier whole. One I have dead comes back to life where the snapshot has it.
+// Another's place is taken as sent, unless its health differs from what I have (a
+// hit is on its way to me): then only its aim, keys and gear. Mine keeps its place;
+// the server's word is my health, my vest and my grenades. The server's tick becomes
+// my clock.
+receive_snapshot :: proc(g: ^Game, m: ^net.Server_Sprite_Snapshot) {
+	if int(m.num) >= sim.MAX_PLAYERS || int(m.weapon) >= len(sim.Weapon_Id) || int(m.secondary_weapon) >= len(sim.Weapon_Id) do return
+	s := &g.world.soldiers[m.num]
+	if !s.active do return
+	if s.dead do revive(g, m.num, m.pos, m.weapon, m.secondary_weapon)
+	if m.num != g.me {
+		if s.health == m.health {
+			s.old_pos = s.pos
+			s.pos, s.vel = m.pos, m.vel
+		}
+		g.others[m.num] = {buttons = net.decode_keys(m.keys), aim = net.aim_in(m.aim_x, m.aim_y)}
+		set_weapons(g, m.num, m.weapon, m.secondary_weapon, m.ammo)
+		s.stance = m.position
+	}
+	s.health, s.vest, s.grenades = m.health, m.vest, i32(m.grenades)
+	g.client_ticks = m.server_ticks
+	g.last_told = m.server_ticks
+}
+
+receive_major :: proc(g: ^Game, m: ^net.Server_Sprite_Snapshot_Major) {
+	if int(m.num) >= sim.MAX_PLAYERS do return
+	s := &g.world.soldiers[m.num]
+	if !s.active do return
+	if s.dead do revive(g, m.num, m.pos, s.weapon.id, s.secondary.id)
+	if m.num != g.me {
+		if s.health == m.health {
+			s.old_pos = s.pos
+			s.pos, s.vel = m.pos, m.vel
+		}
+		g.others[m.num] = {buttons = net.decode_keys(m.keys), aim = net.aim_in(m.aim_x, m.aim_y)}
+		s.stance = m.position
+	}
+	s.health = m.health
+	g.client_ticks = m.server_ticks
+	g.last_told = m.server_ticks
+}
+
+// A dead soldier put somewhere by the server: alive again, there.
+revive :: proc(g: ^Game, slot: u8, pos: sim.Vec2, primary, secondary: sim.Weapon_Id) {
+	s := &g.world.soldiers[slot]
+	sim.soldier_spawn(&g.ctx, s, pos, s.team, primary == .None ? .AK74 : primary, secondary == .None ? .Colt : secondary)
+	g.prev[slot] = pos
+	g.world.ragdolls[slot].active = false
+	sim.emit(&g.events, sim.Respawn{target = slot, pos = pos})
+}
+
+set_weapons :: proc(g: ^Game, slot: u8, primary, secondary: sim.Weapon_Id, ammo: u8) {
+	if int(primary) >= len(sim.Weapon_Id) || int(secondary) >= len(sim.Weapon_Id) do return
+	s := &g.world.soldiers[slot]
+	if s.weapon.id != primary do s.weapon = sim.weapon_state(&g.ctx, primary)
+	if s.secondary.id != secondary do s.secondary = sim.weapon_state(&g.ctx, secondary)
+	s.weapon.ammo = i32(ammo)
+}
+
+// Another's movement as it sent it, relayed: taken as is, unless older than the
+// newest snapshot I have.
+receive_delta_movement :: proc(g: ^Game, m: ^net.Delta_Movement) {
+	if int(m.num) >= sim.MAX_PLAYERS || m.num == g.me || m.server_tick < g.last_told do return
+	s := &g.world.soldiers[m.num]
+	if !s.active || s.dead do return
+	s.pos, s.vel = m.pos, m.vel
+	g.others[m.num] = {buttons = net.decode_keys(m.keys), aim = net.aim_in(m.aim_x, m.aim_y)}
+}
+
+// Another's shot from a slow weapon: made here, then flown on by my round trip and
+// its shooter's, meeting the others as they were that long ago (the bullet's lag) so
+// it lands where the shooter saw it land. Its pellets are rebuilt from its seed.
+receive_bullet :: proc(g: ^Game, m: ^net.Bullet_Snapshot) {
+	w := &g.world
+	if int(m.owner) >= sim.MAX_PLAYERS || int(m.weapon) >= len(sim.Weapon_Id) do return
+	owner := &w.soldiers[m.owner]
+	if !owner.active do return
+	info := &g.ctx.weapons[m.weapon]
+	lag := u8(min(int(owner.ping_ticks) + net.PING_TICKS_ADD, net.MAX_OLD_POS))
+	ahead := int(w.soldiers[g.me].ping_ticks) + int(lag)
+	spawn_ahead(g, m.pos, m.vel, m.weapon, m.owner, info.damage, lag, ahead)
+	more := m.weapon == .Eagle ? 1 : info.style == .Shotgun ? 5 : 0
+	if more == 0 do return
+	rng := u64(m.seed) << 32 | u64(m.seed) | 1
+	straight := m.vel - sim.bullet_spread(&rng, {}, info.spread)
+	for _ in 0 ..< more do spawn_ahead(g, m.pos, sim.bullet_spread(&rng, straight, info.spread), m.weapon, m.owner, info.damage, lag, ahead)
+}
+
+spawn_ahead :: proc(g: ^Game, pos, vel: sim.Vec2, weapon: sim.Weapon_Id, owner: u8, damage: f32, lag: u8, ahead: int) {
+	w := &g.world
+	index, ok := sim.bullet_spawn(&g.ctx, w, pos, vel, weapon, owner, damage, &g.events, lag)
+	if !ok do return
+	for _ in 0 ..< ahead {
+		if !w.bullets[index].active do break
+		sim.bullet_tick(&g.ctx, w, u16(index), &g.events)
+	}
+}
+
+// A death: the corpse as the server started it. My own exploding kill (an M79, a LAW,
+// a grenade) is moved onto its victim and set off here, so the blast shows where it
+// counted (the original's one lag hack).
+receive_death :: proc(g: ^Game, m: ^net.Sprite_Death) {
+	if int(m.num) >= sim.MAX_PLAYERS || int(m.weapon) >= len(sim.Weapon_Id) do return
+	w := &g.world
+	s := &w.soldiers[m.num]
+	if !s.active do return
+	s.health = m.health
+	s.dead = true
+	s.respawn_counter = i32(m.respawn_counter)
+	s.weapon = sim.weapon_state(&g.ctx, .None)
+	w.ragdolls[m.num] = {active = true, pos = m.pos, old_pos = m.old_pos, torn = transmute(sim.Torn)m.torn}
+	sim.emit(&g.events, sim.Kill{killer = m.killer, target = m.num, weapon = m.weapon, pos = s.pos, health = m.health, part = m.part})
+	if m.killer != g.me do return
+	kind: sim.Explosion_Kind
+	#partial switch m.weapon {
+	case .M79, .LAW: kind = .M79
+	case .Frag:      kind = .Frag
+	case: return
+	}
+	for &b, i in w.bullets {
+		if !b.active || b.owner != g.me || b.weapon != m.weapon do continue
+		b.pos = m.pos[sim.RAGDOLL_HEAD]
+		sim.explode(&g.ctx, w, &b, u16(i), kind, -1, -1, &g.events)
+		sim.bullet_end(w, &b, u16(i), &g.events)
+		break
+	}
+}
+
+// The tally, packed by active soldier: unpacked over mine in the same order.
+receive_heartbeat :: proc(g: ^Game, m: ^net.Heart_Beat) {
+	w := &g.world
+	w.round.scores[.Alpha] = i32(m.team_score[0])
+	w.round.scores[.Bravo] = i32(m.team_score[1])
+	k := 0
+	for &s, i in w.soldiers {
+		if !s.active do continue
+		if k >= sim.MAX_PLAYERS || !m.active[k] do break
+		s.kills, s.deaths, s.flags = i32(m.kills[k]), i32(m.deaths[k]), i32(m.caps[k])
+		s.team = m.team[k]
+		if u8(i) != g.me do s.ping_ticks = m.ping[k]
+		k += 1
+	}
+	g.players = k
+	g.heartbeat_at = w.tick
+	g.had_heartbeat = true
+}
+
+// A thing as the server has it. One I did not have yet comes whole with the must
+// snapshot; this one only moves it.
+receive_thing :: proc(g: ^Game, m: ^net.Server_Thing_Snapshot) {
+	if int(m.num) >= sim.MAX_THINGS || int(m.style) >= len(sim.Thing_Style) do return
+	t := &g.world.things[m.num]
+	if t.style == .None {
+		if m.style == .None || m.style == .Weapon do return
+		sim.thing_place(&g.ctx, t, m.style, m.pos[0])
+	}
+	t.style, t.owner, t.holder = m.style, m.owner, m.holder
+	t.pos, t.old_pos = m.pos, m.old_pos
+	t.static = false
+}
+
+receive_thing_must :: proc(g: ^Game, m: ^net.Server_Thing_Must_Snapshot) {
+	if int(m.num) >= sim.MAX_THINGS || int(m.style) >= len(sim.Thing_Style) || m.style == .None || int(m.weapon) >= len(sim.Weapon_Id) do return
+	t := &g.world.things[m.num]
+	sim.thing_place(&g.ctx, t, m.style, m.pos[0], m.weapon)
+	t.owner, t.holder, t.timeout, t.ammo = m.owner, m.holder, m.timeout, i32(m.ammo)
+	t.pos, t.old_pos = m.pos, m.old_pos
+}
+
+// A thing taken, or gone: given here to whoever took it, as the server gave it.
+receive_thing_taken :: proc(g: ^Game, m: ^net.Thing_Taken) {
+	if int(m.num) >= sim.MAX_THINGS do return
+	w := &g.world
+	t := &w.things[m.num]
+	if m.who == net.THING_GONE || int(m.who) >= sim.MAX_PLAYERS {
+		sim.thing_clear(t)
+		return
+	}
+	s := &w.soldiers[m.who]
+	#partial switch m.style {
+	case .Alpha_Flag, .Bravo_Flag:
+		t.holder = m.who + 1
+		t.static = false
+		sim.emit(&g.events, sim.Flag_Grab{player = m.who, thing = m.num, flag = m.style, pos = t.pos[0]})
+	case .Weapon:
+		s.weapon = sim.weapon_state(&g.ctx, t.weapon)
+		s.weapon.ammo = i32(m.ammo)
+		sim.emit(&g.events, sim.Weapon_Pickup{player = m.who, thing = m.num, weapon = t.weapon, pos = t.pos[0]})
+		sim.thing_clear(t)
+	case .Medical_Kit, .Grenade_Kit, .Flamer_Kit, .Predator_Kit, .Vest_Kit, .Berserk_Kit, .Cluster_Kit:
+		sim.kit_give(&g.ctx, w, s, m.style)
+		sim.emit(&g.events, sim.Kit_Pickup{player = m.who, thing = m.num, kit = m.style, pos = t.pos[0]})
+		sim.thing_clear(t)
+	}
+}
+
+receive_flag_info :: proc(g: ^Game, m: ^net.Flag_Info) {
+	if int(m.who) >= sim.MAX_PLAYERS do return
+	pos := g.world.soldiers[m.who].pos
+	switch m.style {
+	case .Capture_Red:  sim.emit(&g.events, sim.Flag_Score{player = m.who, flag = .Alpha_Flag, pos = pos})
+	case .Capture_Blue: sim.emit(&g.events, sim.Flag_Score{player = m.who, flag = .Bravo_Flag, pos = pos})
+	case .Return_Red:   sim.emit(&g.events, sim.Flag_Return{player = m.who, flag = .Alpha_Flag, pos = pos})
+	case .Return_Blue:  sim.emit(&g.events, sim.Flag_Return{player = m.who, flag = .Bravo_Flag, pos = pos})
+	}
 }
 
 // ---- drawing ----
@@ -258,6 +485,5 @@ drawn_pos :: proc(g: ^Game, slot: int, alpha: f32) -> sim.Vec2 {
 		if r := &g.world.ragdolls[slot]; r.active do return r.old_pos[sim.RAGDOLL_HEAD] + (r.pos[sim.RAGDOLL_HEAD] - r.old_pos[sim.RAGDOLL_HEAD]) * alpha
 		return s.pos
 	}
-	if mine_soldier(g, slot) do return g.my_prev + (s.pos - g.my_prev) * alpha + g.smooth
-	return s.old_pos + (s.pos - s.old_pos) * alpha
+	return g.prev[slot] + (s.pos - g.prev[slot]) * alpha
 }

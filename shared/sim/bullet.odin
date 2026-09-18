@@ -14,7 +14,8 @@ Bullet :: struct {
 	style:          Bullet_Style,
 	weapon:         Weapon_Id,
 	owner:          u8,
-	lag:            u8, // ticks behind the present it meets the soldiers, as its shooter saw them
+	lag:            u8, // its shooter's round trip in ticks (OwnerPingTick): how far back it meets the others on a client, and how late its shove lands
+	seed:           u16, // its shooter's shot number: what the others rebuild the pellets from
 	pos, old_pos:   Vec2,
 	vel, forces:    Vec2,
 	initial:        Vec2, // where it was fired: the damage falls off from here
@@ -41,12 +42,13 @@ bullets_update :: proc(ctx: ^Context, w: ^World, events: ^Events) {
 	}
 }
 
-bullet_spawn :: proc(ctx: ^Context, w: ^World, pos, vel: Vec2, weapon: Weapon_Id, owner: u8, damage: f32, events: ^Events) -> (index: int, ok: bool) {
+// A bullet, whatever asks for it. A shot from the keys goes through fire_bullet.
+bullet_spawn :: proc(ctx: ^Context, w: ^World, pos, vel: Vec2, weapon: Weapon_Id, owner: u8, damage: f32, events: ^Events, lag: u8 = 0) -> (index: int, ok: bool) {
 	for &b, i in w.bullets {
 		if b.active do continue
 		info := &ctx.weapons[weapon]
 		b = {
-			active = true, style = info.style, weapon = weapon, owner = owner, lag = w.soldiers[owner].view_lag,
+			active = true, style = info.style, weapon = weapon, owner = owner, lag = lag, seed = w.soldiers[owner].bullet_count,
 			pos = pos, old_pos = pos, vel = vel, initial = pos,
 			timeout = info.timeout, hit_multiply = damage, hit_body = -1,
 		}
@@ -54,6 +56,41 @@ bullet_spawn :: proc(ctx: ^Context, w: ^World, pos, vel: Vec2, weapon: Weapon_Id
 		return i, true
 	}
 	return 0, false
+}
+
+// A shot from the keys (OpenSoldat's CreateBullet without MustCreate), which is not
+// always this machine's to create. A weapon that fires slower than FIRE_INTERVAL_NET
+// is sent over the wire, one message per shot: the machine that plays the shooter
+// makes it and sends it, the server makes it on receiving it, and a client makes it
+// on receiving the relay; so from the keys the server makes none of a player's, and
+// a client none of another's that the server would have relayed to it
+// (bullet_visible). Faster weapons are never sent: every machine makes them from the
+// Fire key.
+FIRE_INTERVAL_NET :: 5
+
+fire_bullet :: proc(ctx: ^Context, w: ^World, pos, vel: Vec2, weapon: Weapon_Id, owner: u8, damage: f32, events: ^Events) -> (index: int, ok: bool) {
+	if ctx.weapons[weapon].fire_interval > FIRE_INTERVAL_NET && int(owner) not_in w.net.mine {
+		if w.net.server do return 0, false
+		if bullet_visible(pos, vel, w.net.view, w.net.view_half) do return 0, false
+	}
+	return bullet_spawn(ctx, w, pos, vel, weapon, owner, damage, events)
+}
+
+// One tick of one bullet, for flying a relayed one on by the pings.
+bullet_tick :: proc(ctx: ^Context, w: ^World, index: u16, events: ^Events) {
+	b := &w.bullets[index]
+	if !b.active do return
+	bullet_update(ctx, w, b, index, events)
+	if b.active do bullet_integrate(w, b)
+}
+
+// Whether a bullet born at `pos` is worth sending to a viewer whose camera is at
+// `view`: inside the box around the view, or inside a wider one when it is flying
+// toward the viewer (OpenSoldat's BulletCanSend).
+bullet_visible :: proc(pos, vel, view, half: Vec2) -> bool {
+	if abs(pos.x - view.x) < half.x && abs(pos.y - view.y) < half.y do return true
+	toward := (view.x < pos.x && vel.x < 0) || (view.x > pos.x && vel.x > 0)
+	return toward && abs(pos.x - view.x) < 1640 && abs(pos.y - view.y) < 680
 }
 
 // Every deactivation goes through here so the end event is emitted where it happens.

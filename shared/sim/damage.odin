@@ -22,7 +22,6 @@ damage_apply :: proc(ctx: ^Context, w: ^World, hit: Hit, events: ^Events) {
 	if attacker.bonus == .Berserker && hit.shooter != hit.target do amount = 4 * hit.amount
 
 	s.health = clamp(s.health - amount, BRUTAL_DEATH_HEALTH, DEFAULT_HEALTH)
-	s.next_push += hit.push
 	emit(events, Damage{attacker = hit.shooter, target = hit.target, weapon = hit.weapon, amount = amount, vest = vested})
 	if s.health < 1 do die(ctx, w, hit, events)
 }

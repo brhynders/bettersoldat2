@@ -14,6 +14,7 @@ Connection :: struct {
 	peer:     ^enet.Peer,
 	slot:     u8,
 	map_name: string, // the server's, from the welcome
+	welcome:  net.Welcome, // the rest of it: the server's tick and who is playing
 	inbox:    [dynamic][]u8, // copies of received packets, owned here until drained
 	fake:     net.Fake_Link,
 	lost:     bool, // the server went away
@@ -51,6 +52,8 @@ open :: proc(c: ^Connection, address: string, port: u16, name: string) -> bool {
 				if m, ok := net.decode_welcome(&r); ok {
 					c.slot = m.slot
 					c.map_name = fmt.aprint(m.map_name)
+					c.welcome = m
+					c.welcome.map_name = c.map_name
 					enet.packet_destroy(event.packet)
 					return true
 				}

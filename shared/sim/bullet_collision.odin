@@ -279,7 +279,8 @@ soldier_collide_bullet :: proc(ctx: ^Context, w: ^World, b: ^Bullet, index: u16,
 		push: Vec2
 		if b.style != .Frag_Grenade && b.style != .Flame && b.style != .Arrow do push = b.vel * info.push
 		modifier := hitbox_modifier(info, part)
-		wound :: proc(events: ^Events, b: ^Bullet, ti: int, amount: f32, part: int, point, push: Vec2) {
+		wound :: proc(w: ^World, events: ^Events, b: ^Bullet, ti: int, amount: f32, part: int, point, push: Vec2) {
+			soldier_shove(w, u8(ti), b.lag, push)
 			emit(events, Hit{shooter = b.owner, target = u8(ti), weapon = b.weapon, amount = amount, part = u8(part + 1), pos = point, push = push})
 		}
 
@@ -288,7 +289,7 @@ soldier_collide_bullet :: proc(ctx: ^Context, w: ^World, b: ^Bullet, index: u16,
 			b.pos = point
 			emit(events, Blood{shooter = b.owner, target = u8(ti), pos = point, vel = b.vel})
 			speed := vec2_length(b.vel)
-			wound(events, b, ti, speed * b.hit_multiply * modifier, part, point, push)
+			wound(w, events, b, ti, speed * b.hit_multiply * modifier, part, point, push)
 			b.hit_body = i8(ti)
 			// a punched enemy starts throwing its gun away
 			if b.style == .Punch && (target.team == .None || target.team != owner.team) && target.weapon.id != .Bow && target.weapon.id != .Bow2 {
@@ -311,13 +312,13 @@ soldier_collide_bullet :: proc(ctx: ^Context, w: ^World, b: ^Bullet, index: u16,
 			b.pos = point - b.vel
 			b.forces.y -= w.gravity * BULLET_GRAVITY
 			emit(events, Blood{shooter = b.owner, target = u8(ti), pos = point, vel = b.vel})
-			wound(events, b, ti, vec2_length(b.vel) * b.hit_multiply * modifier, part, point, push)
+			wound(w, events, b, ti, vec2_length(b.vel) * b.hit_multiply * modifier, part, point, push)
 			bullet_end(w, b, index, events, point)
 		case .M79, .Flame_Arrow, .LAW:
 			explode(ctx, w, b, index, .M79, ti, part, events)
 			b.pos = point
 			bullet_end(w, b, index, events)
-			wound(events, b, ti, vec2_length(b.vel) * b.hit_multiply, part, point, push)
+			wound(w, events, b, ti, vec2_length(b.vel) * b.hit_multiply, part, point, push)
 		case .Flame:
 			if ti == int(b.owner) do return point, true
 			b.pos = pose[part]
@@ -328,13 +329,13 @@ soldier_collide_bullet :: proc(ctx: ^Context, w: ^World, b: ^Bullet, index: u16,
 					b.ricochet_count += 1
 					bullet_spawn(ctx, w, pose[part], -target.vel, .Flamer, b.owner, 2 * b.hit_multiply / 3, events)
 				}
-				if target.health > -1 do wound(events, b, ti, b.hit_multiply, part, point, {})
+				if target.health > -1 do wound(w, events, b, ti, b.hit_multiply, part, point, {})
 			}
 		case .Cluster:
 			explode(ctx, w, b, index, .Cluster, ti, part, events)
 			bullet_end(w, b, index, events)
 		case .Thrown_Knife:
-			wound(events, b, ti, vec2_length(b.vel) * b.hit_multiply * 0.01, part, point, push)
+			wound(w, events, b, ti, vec2_length(b.vel) * b.hit_multiply * 0.01, part, point, push)
 			bullet_end(w, b, index, events)
 		}
 		return point, true

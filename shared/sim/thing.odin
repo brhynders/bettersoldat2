@@ -179,7 +179,7 @@ things_spawn :: proc(ctx: ^Context, w: ^World) {
 
 things_update :: proc(ctx: ^Context, w: ^World, events: ^Events) {
 	for &t, i in w.things {
-		thing_pickup(ctx, w, &t, u8(i), events)
+		if w.net.server do thing_pickup(ctx, w, &t, u8(i), events) // the server alone gives things; a client hears of it
 		switch t.style {
 		case .None:
 			kit_respawn_tick(ctx, w, &t)

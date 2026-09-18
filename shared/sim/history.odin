@@ -1,13 +1,12 @@
 package sim
 
-// Where everyone was over the last second, kept on the server so a shot is judged
-// against the soldiers as its shooter saw them. A client shows the others some ticks
-// behind the present and says how many with each command; a bullet it fires carries
-// that lag and meets the soldiers from that many ticks ago, out of this ring, for
-// as long as it flies. A world without a history (a client's) judges against the
-// present.
+// Where everyone was over the last two seconds, kept on a client (OldSpritePos) so a
+// bullet that came over the wire meets the others as its shooter saw them: it carries
+// the shooter's round trip as its lag and meets the soldiers from that many ticks
+// ago, out of this ring, for as long as it flies. The server keeps no history and
+// judges every bullet against the present: it does no lag compensation.
 
-HISTORY_TICKS :: 64
+HISTORY_TICKS :: 128 // OpenSoldat keeps 125 (MAX_OLDPOS)
 
 History :: struct {
 	frames: [HISTORY_TICKS][MAX_PLAYERS]Soldier, // by tick modulo the ring

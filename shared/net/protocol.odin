@@ -1,42 +1,122 @@
-// Package net is the wire protocol. Transport is ENet (vendor:ENet); this package only
-// encodes and decodes messages.
+// Package net is the wire protocol: OpenSoldat's, copied message for message from the
+// upstream source (commit c993a44 of the fork, its NetworkClient*/NetworkServer* and
+// Net.pas), with its message ids, fields and sizes, and its rules for when each goes.
+// The transport is ENet in place of GameNetworkingSockets, with the same two kinds of
+// delivery the original uses: unreliable for everything that moves, reliable for the
+// rest. A message is one packed record behind its id byte, and a packet whose size is
+// not exactly the record's is dropped (VerifyPacket).
 //
-// The server is authoritative: clients send Inputs (their commands, numbered by
-// themselves), the server runs the one true world and sends every client a Snapshot
-// of it every SNAPSHOT_EVERY ticks: the soldiers, things and bullets whole, the
-// events since the last one, and for the receiver its last applied command and how
-// many were waiting. A client predicts itself by replaying its unacknowledged
-// commands on the latest snapshot and shows everyone else interpolated between two
-// older ones.
-//
-// A snapshot goes as a delta against the newest one the client says it holds: only
-// the entities that changed, and of those only the 4-byte words that changed, under
-// a mask. A client that holds nothing useful gets it whole. The state goes as the
-// sim's structs, byte for byte, so the same build must run on both ends; the hello
-// carries the build's layout so a mismatch is refused rather than misread.
+// The model: a client owns its own soldier and tells the server where it is, which
+// the server takes as the truth. The server sends everyone every soldier now and then
+// (the snapshots), and relays each client's movement packet to those who can see it
+// (the deltas); a client steps everyone else on from the last keys it heard. Slow
+// weapons' shots cross the wire as bullets; fast weapons' are made everywhere from the
+// Fire key. Only the server wounds; a client learns its health from the snapshots.
 package net
 
 import "../sim"
 
-VERSION      :: 3
+VERSION      :: 4
 DEFAULT_PORT :: 23073
 
-SNAPSHOT_EVERY :: 2 // ticks between snapshots: 30 a second at 60 ticks
-
-CHANNEL_UNRELIABLE :: 0 // inputs, snapshots
-CHANNEL_RELIABLE   :: 1 // the handshake, the lobby
+CHANNEL_UNRELIABLE :: 0
+CHANNEL_RELIABLE   :: 1
 CHANNEL_COUNT      :: 2
 
 // The layout the state crosses the wire in, checked at the hello.
 LAYOUT :: u32(size_of(sim.Soldier)) << 16 | u32(size_of(sim.Thing)) << 8 | u32(size_of(sim.Bullet))
 
+// OpenSoldat's MsgID_ numbers. The handshake reuses RequestGame, PlayersList and
+// UnAccepted; the rest are the gameplay messages, by their numbers.
 Msg :: enum u8 {
-	None,
-	// the lobby, reliable
-	Hello, Welcome, Denied, Roster, Chat, Leave, Map_Change, Settings,
-	// the game, unreliable
-	Input,    // client -> server: my recent commands
-	Snapshot, // server -> client: the world as of one tick
+	Heart_Beat                   = 2,
+	Server_Sprite_Snapshot       = 3,
+	Client_Sprite_Snapshot       = 4,
+	Bullet_Snapshot              = 5, // both ways, two records: the size tells them apart
+	Server_Skeleton_Snapshot     = 7,
+	Server_Thing_Snapshot        = 9,
+	Thing_Taken                  = 12,
+	Sprite_Death                 = 13,
+	Welcome                      = 16, // PlayersList
+	New_Player                   = 17,
+	Player_Disconnect            = 19,
+	Delta_Movement               = 21,
+	Delta_Weapons                = 25,
+	Ping                         = 30,
+	Pong                         = 31,
+	Flag_Info                    = 32,
+	Server_Thing_Must_Snapshot   = 33,
+	Server_Sprite_Snapshot_Major = 41,
+	Client_Sprite_Snapshot_Mov   = 42,
+	Client_Sprite_Snapshot_Dead  = 43,
+	Denied                       = 44, // UnAccepted
+	Hello                        = 58, // RequestGame
+}
+
+// ---- the constants the rules use (Constants.pas, Cvar.pas) ----
+
+POS_DELTA        :: 60.0 // a client sends its movement when it moved further than this...
+VEL_DELTA        :: 0.27 // ...or its velocity changed more than this
+MOUSE_AIM_DELTA  :: 30   // ...or its aim moved more than this on the screen
+MIN_MOVE_DELTA   :: 0.63 // a thing that moved less is not sent
+MAX_GAME_WIDTH   :: 480 * 1.78 // the server's guess of a client's view: half its width...
+GAME_HEIGHT      :: 480.0      // ...and half its height, about the camera
+MUZZLE_REACH     :: 366.0      // a shot born further from its shooter is refused
+
+// Every so many ticks, on the Internet (the LAN rates are not copied).
+T_SNAPSHOT       :: 35  // net_t1_snapshot
+T_MAJOR_SNAPSHOT :: 19  // net_t1_majorsnapshot
+T_DEAD_SNAPSHOT  :: 50  // net_t1_deadsnapshot
+T_HEARTBEAT      :: 135 // net_t1_heartbeat
+T_DELTA          :: 4   // net_t1_delta: the bots' deltas
+T_PING           :: 21  // net_t1_ping
+T_THING_SNAPSHOT :: 31  // net_t1_thingsnapshot
+
+CLIENT_STOP_MOVE_RETRYS :: 90  // ticks without a ping before a client freezes, and the server stops stepping it
+CONNECTION_PROBLEM_TIME :: 240 // ticks without a heartbeat before a client freezes for good
+DISCONNECTION_TIME      :: 900 // ticks without a pong before the server drops a client
+PING_SLOTS              :: 8   // pings in flight per client
+PING_TICKS_ADD          :: 2   // a client adds this to a shooter's ping when flying its bullet on
+BULLET_CHECK_SEEDS      :: 20  // a shot's seed must not be among the last so many
+BULLET_WARNINGS         :: 3   // shots too soon after the last, before they are refused
+MAX_OLD_POS             :: 125 // ticks of lag a bullet may carry
+
+// The packet-rate scale by how many are playing: fewer players, more packets.
+server_adjust :: proc(players: int) -> f32 { return players < 5 ? 0.66 : players < 9 ? 0.75 : 1 }
+client_adjust :: proc(players: int) -> f32 { return players < 5 ? 0.75 : players < 9 ? 0.87 : 1 }
+
+// A tick on a schedule: every `every` ticks, scaled.
+due :: proc(tick: u32, every: int, adjust: f32, phase: u32 = 0) -> bool {
+	period := u32(max(int(f32(every) * adjust + 0.5), 1))
+	return tick % period == phase
+}
+
+// ---- the keys on the wire: Keys16 (NetworkUtils.pas EncodeKeys) ----
+
+KEY_BITS := [?]struct { bit: u16, button: sim.Button }{
+	{1 << 0, .Left}, {1 << 1, .Right}, {1 << 2, .Jump}, {1 << 3, .Crouch}, {1 << 4, .Fire},
+	{1 << 5, .Jet}, {1 << 6, .Throw}, {1 << 7, .Change}, {1 << 8, .Drop}, {1 << 9, .Reload},
+	{1 << 10, .Flag_Throw},
+}
+KEY_JET :: u16(1 << 5)
+
+encode_keys :: proc(b: sim.Buttons) -> (k: u16) {
+	for e in KEY_BITS do if e.button in b do k |= e.bit
+	return
+}
+
+decode_keys :: proc(k: u16) -> (b: sim.Buttons) {
+	for e in KEY_BITS do if k & e.bit != 0 do b += {e.button}
+	return
+}
+
+// The aim on the wire: whole units, 16 bits each.
+aim_out :: proc(v: sim.Vec2) -> (x, y: i16) {
+	return i16(clamp(v.x, -32000, 32000)), i16(clamp(v.y, -32000, 32000))
+}
+
+aim_in :: proc(x, y: i16) -> sim.Vec2 {
+	return {f32(x), f32(y)}
 }
 
 // ---- the handshake (reliable) ----
@@ -49,10 +129,12 @@ Hello :: struct {
 	name:    string,
 }
 
+// PlayersList: the newcomer's slot, the server's tick, the map, and who is playing.
 Welcome :: struct {
-	slot:     u8,
-	tick:     u32,
-	map_name: string,
+	slot:         u8,
+	server_ticks: i32,
+	map_name:     string,
+	teams:        [sim.MAX_PLAYERS]sim.Team, // .None for an empty slot
 }
 
 encode_hello :: proc(w: ^Writer, name: string) {
@@ -69,17 +151,19 @@ decode_hello :: proc(r: ^Reader) -> (m: Hello, ok: bool) {
 	return m, r.ok
 }
 
-encode_welcome :: proc(w: ^Writer, m: Welcome) {
+encode_welcome :: proc(w: ^Writer, m: ^Welcome) {
 	write_u8(w, u8(Msg.Welcome))
 	write_u8(w, m.slot)
-	write_u32(w, m.tick)
+	write_u32(w, u32(m.server_ticks))
 	write_string(w, m.map_name)
+	for t in m.teams do write_u8(w, u8(t))
 }
 
 decode_welcome :: proc(r: ^Reader) -> (m: Welcome, ok: bool) {
 	m.slot = read_u8(r)
-	m.tick = read_u32(r)
+	m.server_ticks = i32(read_u32(r))
 	m.map_name = read_string(r)
+	for &t in m.teams do t = sim.Team(read_u8(r))
 	return m, r.ok
 }
 
@@ -88,204 +172,165 @@ encode_denied :: proc(w: ^Writer, reason: string) {
 	write_string(w, reason)
 }
 
-// ---- inputs (client -> server, unreliable, every tick) ----
+// ---- the records: one packed struct per message, sent and read whole ----
 
-// The last few commands, oldest first, so a lost packet loses nothing: the server
-// keeps the ones it has not seen. `view_tick` is the server tick the client is
-// showing the others at, for the server to judge its shots against; `have` the
-// newest snapshot it holds, for the server to send the next as a delta against.
-MAX_COMMANDS_PER_INPUT :: 8
+Vec2 :: sim.Vec2 // x, y: two 32-bit floats
 
-Input :: struct {
-	view_tick: u32,
-	have:      u32,
-	commands:  [MAX_COMMANDS_PER_INPUT]sim.Command,
-	count:     int,
+New_Player :: struct #packed { num: u8, team: sim.Team }
+Player_Disconnect :: struct #packed { num: u8 }
+
+// Client -> server. What I hold, when it changed; where I am, every few ticks; that I
+// am dead, now and then; a slow weapon's shot, as it leaves; a pong to each ping.
+Client_Sprite_Snapshot :: struct #packed {
+	ammo, secondary_ammo:     u8,
+	weapon, secondary_weapon: sim.Weapon_Id,
+	position:                 sim.Stance,
 }
 
-encode_input :: proc(w: ^Writer, m: ^Input) {
-	write_u8(w, u8(Msg.Input))
-	write_u32(w, m.view_tick)
-	write_u32(w, m.have)
-	write_u8(w, u8(m.count))
-	for i in 0 ..< m.count do write_raw(w, &m.commands[i], size_of(sim.Command))
+Client_Sprite_Snapshot_Mov :: struct #packed {
+	pos, vel:     Vec2,
+	keys:         u16,
+	aim_x, aim_y: i16,
 }
 
-decode_input :: proc(r: ^Reader) -> (m: Input, ok: bool) {
-	m.view_tick = read_u32(r)
-	m.have = read_u32(r)
-	m.count = min(int(read_u8(r)), MAX_COMMANDS_PER_INPUT)
-	for i in 0 ..< m.count do read_raw(r, &m.commands[i], size_of(sim.Command))
-	return m, r.ok
+Client_Sprite_Snapshot_Dead :: struct #packed { camera_focus: u8 }
+
+Client_Bullet_Snapshot :: struct #packed {
+	weapon:       sim.Weapon_Id,
+	pos, vel:     Vec2,
+	seed:         u16, // the shot's number: the pellets are rebuilt from it
+	client_ticks: i32, // the client's tick, for the server to reckon its one-way lag
 }
 
-// ---- snapshots (server -> client, unreliable) ----
+Pong :: struct #packed { ping_num: u8 }
 
-// The world as of `tick`: every active soldier, thing and bullet whole, the round, and
-// what happened since the last snapshot. `ack` is the receiver's last command the
-// server applied; `queue_depth` how many of its commands were waiting when the tick
-// began, which the client steers toward a small target by running its clock faster
-// or slower. `base` is the tick this one was sent as a delta against, 0 for whole.
-//
-// What happened comes two ways. The players' actions (a shot, a wall hit, blood) are
-// told once, in the snapshot of their tick: a lost one loses a spark. What only the
-// server decides (a wound, a kill, a respawn, a pickup, a score) is a fact, numbered
-// per client and carried in every snapshot until one that carried it is
-// acknowledged, so none is ever lost. sim.event_owner tells the two apart.
-Snapshot :: struct {
-	tick:        u32,
-	base:        u32,
-	ack:         u32,
-	queue_depth: u8,
-	round:       sim.Round,
-	soldiers:    [sim.MAX_PLAYERS]sim.Soldier,
-	things:      [sim.MAX_THINGS]sim.Thing,
-	bullets:     [sim.MAX_BULLETS]sim.Bullet,
-	events:      sim.Events,
-	facts:       [MAX_FACTS_PER_SNAPSHOT]Timed_Event,
-	fact_count:  int,
+// Server -> client. A soldier whole (the snapshot), or its movement and health (the
+// major one), or its bones' timer while dead; a movement packet relayed to those who
+// can see it (the delta), and a weapon change; a relayed shot; a death, with the
+// corpse's points; the tally, now and then; a ping; the things.
+Server_Sprite_Snapshot :: struct #packed {
+	num:                      u8,
+	pos, vel:                 Vec2,
+	aim_x, aim_y:             i16,
+	position:                 sim.Stance,
+	keys:                     u16,
+	look:                     u8, // the helmet and the cigar: nothing here, kept for the size
+	vest, health:             f32,
+	ammo, grenades:           u8,
+	weapon, secondary_weapon: sim.Weapon_Id,
+	server_ticks:             i32,
 }
 
-// An event with the tick it happened at, and for a fact its number.
-Timed_Event :: struct {
-	seq:  u32,
-	tick: u32,
-	e:    sim.Event,
+Server_Sprite_Snapshot_Major :: struct #packed {
+	num:          u8,
+	pos, vel:     Vec2,
+	health:       f32,
+	aim_x, aim_y: i16,
+	position:     sim.Stance,
+	keys:         u16,
+	server_ticks: i32,
 }
 
-MAX_FACTS_PER_SNAPSHOT :: 32
+Server_Skeleton_Snapshot :: struct #packed { num: u8, respawn_counter: i16 }
 
-// Against `base` when there is one: an entity present in both goes as its changed
-// words, one new to this snapshot whole, one gone from it by index; the rest are not
-// mentioned and the receiver keeps its copy. Without a base everything goes whole.
-encode_snapshot :: proc(w: ^Writer, m: ^Snapshot, base: ^Snapshot, facts: []Timed_Event) {
-	write_u8(w, u8(Msg.Snapshot))
-	write_u32(w, m.tick)
-	write_u32(w, base != nil ? base.tick : 0)
-	write_u32(w, m.ack)
-	write_u8(w, m.queue_depth)
-	if base == nil do write_raw(w, &m.round, size_of(sim.Round))
-	else do write_words(w, &m.round, &base.round, size_of(sim.Round))
-
-	// the soldiers
-	changed, gone: [sim.MAX_PLAYERS]u8
-	n, g := 0, 0
-	for &s, i in m.soldiers {
-		had := base != nil && base.soldiers[i].active
-		if s.active && (!had || differs(&s, &base.soldiers[i], size_of(sim.Soldier))) { changed[n] = u8(i); n += 1 }
-		if !s.active && had { gone[g] = u8(i); g += 1 }
-	}
-	write_u8(w, u8(n))
-	for i in changed[:n] {
-		write_u8(w, i)
-		if base != nil && base.soldiers[i].active do write_words(w, &m.soldiers[i], &base.soldiers[i], size_of(sim.Soldier))
-		else do write_raw(w, &m.soldiers[i], size_of(sim.Soldier))
-	}
-	write_u8(w, u8(g))
-	for i in gone[:g] do write_u8(w, i)
-
-	// the things
-	tchanged, tgone: [sim.MAX_THINGS]u8
-	n, g = 0, 0
-	for &t, i in m.things {
-		had := base != nil && base.things[i].style != .None
-		if t.style != .None && (!had || differs(&t, &base.things[i], size_of(sim.Thing))) { tchanged[n] = u8(i); n += 1 }
-		if t.style == .None && had { tgone[g] = u8(i); g += 1 }
-	}
-	write_u8(w, u8(n))
-	for i in tchanged[:n] {
-		write_u8(w, i)
-		if base != nil && base.things[i].style != .None do write_words(w, &m.things[i], &base.things[i], size_of(sim.Thing))
-		else do write_raw(w, &m.things[i], size_of(sim.Thing))
-	}
-	write_u8(w, u8(g))
-	for i in tgone[:g] do write_u8(w, i)
-
-	// the bullets
-	bchanged, bgone: [sim.MAX_BULLETS]u16
-	n, g = 0, 0
-	for &b, i in m.bullets {
-		had := base != nil && base.bullets[i].active
-		if b.active && (!had || differs(&b, &base.bullets[i], size_of(sim.Bullet))) { bchanged[n] = u16(i); n += 1 }
-		if !b.active && had { bgone[g] = u16(i); g += 1 }
-	}
-	write_u16(w, u16(n))
-	for i in bchanged[:n] {
-		write_u16(w, i)
-		if base != nil && base.bullets[i].active do write_words(w, &m.bullets[i], &base.bullets[i], size_of(sim.Bullet))
-		else do write_raw(w, &m.bullets[i], size_of(sim.Bullet))
-	}
-	write_u16(w, u16(g))
-	for i in bgone[:g] do write_u16(w, i)
-
-	write_u16(w, u16(m.events.count))
-	for i in 0 ..< m.events.count do write_raw(w, &m.events.items[i], size_of(sim.Event))
-	write_u8(w, u8(len(facts)))
-	for &f in facts do write_raw(w, &f, size_of(Timed_Event))
+Delta_Movement :: struct #packed {
+	num:          u8,
+	pos, vel:     Vec2,
+	keys:         u16,
+	aim_x, aim_y: i16,
+	server_tick:  i32,
 }
 
-// The header alone: which base the rest needs.
-decode_snapshot_head :: proc(r: ^Reader) -> (tick, base: u32) {
-	tick = read_u32(r)
-	base = read_u32(r)
-	return
+Delta_Weapons :: struct #packed { num: u8, weapon, secondary_weapon: sim.Weapon_Id, ammo: u8 }
+
+Bullet_Snapshot :: struct #packed {
+	owner:    u8,
+	weapon:   sim.Weapon_Id,
+	pos, vel: Vec2,
+	seed:     u16,
+	forced:   bool, // the server's own (a script's): to everyone, its owner too
 }
 
-// The rest, after the head, into `m`, which must hold a copy of the base (or be
-// cleared when there is none).
-decode_snapshot :: proc(r: ^Reader, m: ^Snapshot, tick, base_tick: u32, base: ^Snapshot) -> bool {
-	m.tick = tick
-	m.base = base_tick
-	m.ack = read_u32(r)
-	m.queue_depth = read_u8(r)
-	if base == nil do read_raw(r, &m.round, size_of(sim.Round))
-	else do read_words(r, &m.round, size_of(sim.Round))
+// The corpse as the server started it, so every client starts it the same.
+Sprite_Death :: struct #packed {
+	num, killer:     u8,
+	weapon:          sim.Weapon_Id, // KillBullet
+	part:            u8,
+	torn:            u32,           // Constraints
+	pos, old_pos:    [sim.RAGDOLL_POINTS]Vec2,
+	health:          f32,
+	respawn_counter: i16,
+}
 
-	soldiers := int(read_u8(r))
-	for _ in 0 ..< soldiers {
-		i := int(read_u8(r))
-		if i >= sim.MAX_PLAYERS do return false
-		if base != nil && base.soldiers[i].active do read_words(r, &m.soldiers[i], size_of(sim.Soldier))
-		else do read_raw(r, &m.soldiers[i], size_of(sim.Soldier))
-	}
-	gone := int(read_u8(r))
-	for _ in 0 ..< gone {
-		i := int(read_u8(r))
-		if i >= sim.MAX_PLAYERS do return false
-		m.soldiers[i] = {}
-	}
+// The tally. The entries are packed: the k-th entry is the k-th active soldier's, on
+// both ends (the client counts its own active soldiers to unpack them).
+Heart_Beat :: struct #packed {
+	map_id:             u32,
+	team_score:         [4]u16,
+	active:             [sim.MAX_PLAYERS]bool,
+	kills:              [sim.MAX_PLAYERS]u16,
+	caps:               [sim.MAX_PLAYERS]u8,
+	team:               [sim.MAX_PLAYERS]sim.Team,
+	deaths:             [sim.MAX_PLAYERS]u16,
+	ping:               [sim.MAX_PLAYERS]u8, // ticks, and a byte: a round trip past 255 wraps
+	real_ping:          [sim.MAX_PLAYERS]u16,
+	connection_quality: [sim.MAX_PLAYERS]u8,
+	flags:              [sim.MAX_PLAYERS]u8,
+}
 
-	things := int(read_u8(r))
-	for _ in 0 ..< things {
-		i := int(read_u8(r))
-		if i >= sim.MAX_THINGS do return false
-		if base != nil && base.things[i].style != .None do read_words(r, &m.things[i], size_of(sim.Thing))
-		else do read_raw(r, &m.things[i], size_of(sim.Thing))
-	}
-	gone = int(read_u8(r))
-	for _ in 0 ..< gone {
-		i := int(read_u8(r))
-		if i >= sim.MAX_THINGS do return false
-		m.things[i] = {}
-	}
+Ping :: struct #packed { ping_ticks: u8, ping_num: u8 }
 
-	bullets := int(read_u16(r))
-	for _ in 0 ..< bullets {
-		i := int(read_u16(r))
-		if i >= sim.MAX_BULLETS do return false
-		if base != nil && base.bullets[i].active do read_words(r, &m.bullets[i], size_of(sim.Bullet))
-		else do read_raw(r, &m.bullets[i], size_of(sim.Bullet))
-	}
-	gone = int(read_u16(r))
-	for _ in 0 ..< gone {
-		i := int(read_u16(r))
-		if i >= sim.MAX_BULLETS do return false
-		m.bullets[i] = {}
-	}
+Server_Thing_Snapshot :: struct #packed {
+	num, owner:   u8,
+	style:        sim.Thing_Style,
+	holder:       u8, // HoldingSprite: index + 1, 0 loose
+	pos, old_pos: [4]Vec2,
+}
 
-	m.events.count = min(int(read_u16(r)), sim.MAX_EVENTS)
-	for i in 0 ..< m.events.count do read_raw(r, &m.events.items[i], size_of(sim.Event))
-	m.fact_count = min(int(read_u8(r)), MAX_FACTS_PER_SNAPSHOT)
-	for i in 0 ..< m.fact_count do read_raw(r, &m.facts[i], size_of(Timed_Event))
+// A thing that just appeared, whole: and which gun it is, which the original's
+// styles carry and ours do not.
+Server_Thing_Must_Snapshot :: struct #packed {
+	num, owner:   u8,
+	style:        sim.Thing_Style,
+	holder:       u8,
+	pos, old_pos: [4]Vec2,
+	timeout:      i32,
+	weapon:       sim.Weapon_Id,
+	ammo:         i16,
+}
+
+Thing_Taken :: struct #packed {
+	num, who: u8, // who 255: the thing is gone
+	style:    sim.Thing_Style,
+	ammo:     u8,
+}
+
+THING_GONE :: 255
+
+Flag_Style :: enum u8 { Return_Red = 1, Return_Blue = 2, Capture_Red = 3, Capture_Blue = 4 }
+Flag_Info :: struct #packed { style: Flag_Style, who: u8 }
+
+// ---- writing and reading the records ----
+
+// A record behind its id, into a fresh writer: the packet.
+put :: proc(w: ^Writer, id: Msg, m: ^$T) {
+	w.len = 0
+	w.overflow = false
+	write_u8(w, u8(id))
+	write_raw(w, m, size_of(T))
+}
+
+// A record out of a packet, which must be exactly its size (VerifyPacket).
+get :: proc(r: ^Reader, m: ^$T) -> bool {
+	if len(r.data) - r.pos != size_of(T) do return false
+	read_raw(r, m, size_of(T))
 	return r.ok
+}
+
+reliable :: proc(id: Msg) -> bool {
+	#partial switch id {
+	case .Hello, .Welcome, .Denied, .New_Player, .Player_Disconnect, .Ping, .Pong, .Flag_Info:
+		return true
+	}
+	return false
 }

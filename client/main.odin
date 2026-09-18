@@ -1,7 +1,7 @@
 // The client. Reads as what it is: each subsystem opened, the loop, each closed.
 //
 //   connection   the link to the server (connection/)
-//   game         the world: snapshots, my prediction, everyone else shown late (game/)
+//   game         the world: mine as I play it, the rest as the server tells it (game/)
 //   input        the keys and mouse, or a script (input/)
 //   render       the window's picture: camera, map, soldiers, sparks (render/)
 //   audio        the sounds (audio/)
@@ -10,15 +10,14 @@
 // my commands out. Each frame: the camera follows me and the world is drawn between
 // the last two ticks. Everything the client is lives in App; nothing else is global.
 //
-//   client -join IP [-port N] [-base DIR] [-name NAME] [-window] [-interp-ticks N]
+//   client -join IP [-port N] [-base DIR] [-name NAME] [-window]
 //          [-ping MS] [-jitter MS] [-loss PERCENT] [-headless]
 //
 // The client plays the map the server names. -ping, -jitter and -loss put a simulated
 // bad line between this client and the server, for testing. -headless runs without a
 // window, its input scripted (input/script.odin): a player for the netcode's tests,
 // which reports what it saw with -seconds. The bots are the server's (-bots N there).
-// -interp-ticks fixes how far behind the newest snapshot the world is shown (by
-// default it follows the jitter). The debug options are in debug.odin.
+// The debug options are in debug.odin.
 package client
 
 import "core:fmt"
@@ -60,7 +59,6 @@ Options :: struct {
 	name:         string,
 	windowed:     bool,
 	headless:     bool, // no window: scripted input, for tests
-	interp_ticks: int,  // how far behind the newest snapshot the world is shown; 0: by the jitter
 	ping, jitter, loss: f64, // the simulated line: round trip ms, extra ms at random, percent lost
 }
 
@@ -70,7 +68,7 @@ main :: proc() {
 	app.options, app.debug = parse_options()
 	o := &app.options
 	if o.join == "" {
-		fmt.eprintln("usage: client -join IP [-port N] [-base DIR] [-name NAME] [-window] [-interp-ticks N] [-ping MS] [-jitter MS] [-loss PERCENT] [-headless]")
+		fmt.eprintln("usage: client -join IP [-port N] [-base DIR] [-name NAME] [-window] [-ping MS] [-jitter MS] [-loss PERCENT] [-headless]")
 		os.exit(2)
 	}
 	if o.headless {
@@ -81,7 +79,7 @@ main :: proc() {
 	rl.SetTraceLogLevel(.WARNING)
 	open_window(o.windowed)
 	open_connection()
-	if !game.init(&app.game, o.base, app.conn.map_name, app.conn.slot, o.interp_ticks) do fail("could not load %s from %s", app.conn.map_name, o.base)
+	if !game.init(&app.game, o.base, &app.conn.welcome) do fail("could not load %s from %s", app.conn.map_name, o.base)
 	render.init(&app.render, o.base, &app.game.level)
 	audio.init(&app.audio, o.base)
 	app.camera.zoom = 1
@@ -94,10 +92,10 @@ main :: proc() {
 		ticks := ticks_owed(dt)
 		for _ in 0 ..< ticks {
 			game.receive(&app.game, &app.conn)
-			game.simulate(&app.game, &app.input)
+			game.simulate(&app.game, &app.input, app.camera.pos, render.view_size(&app.camera))
 			render.tick(&app.render, &app.game)
 			audio.tick(&app.audio, &app.game, app.camera.pos)
-			game.send(&app.game, &app.conn)
+			game.send(&app.game, &app.conn, &app.input, cursor())
 			input.clear(&app.input)
 		}
 
@@ -119,7 +117,7 @@ main :: proc() {
 run_headless :: proc() {
 	o := &app.options
 	open_connection()
-	if !game.init(&app.game, o.base, app.conn.map_name, app.conn.slot, o.interp_ticks) do fail("could not load %s from %s", app.conn.map_name, o.base)
+	if !game.init(&app.game, o.base, &app.conn.welcome) do fail("could not load %s from %s", app.conn.map_name, o.base)
 	input.script_init(&app.script, u64(app.conn.slot) + 1)
 	debug_init(&app.debug, &app.game, &app.camera)
 
@@ -130,8 +128,8 @@ run_headless :: proc() {
 		ticks := ticks_owed(dt)
 		for _ in 0 ..< ticks {
 			game.receive(&app.game, &app.conn)
-			game.simulate(&app.game, &app.input)
-			game.send(&app.game, &app.conn)
+			game.simulate(&app.game, &app.input, app.game.world.soldiers[app.game.me].pos, {net.MAX_GAME_WIDTH, net.GAME_HEIGHT})
+			game.send(&app.game, &app.conn, &app.input, {})
 			input.clear(&app.input)
 		}
 
@@ -150,12 +148,11 @@ open_connection :: proc() {
 	connection.simulate_line(&app.conn, o.ping, o.jitter, o.loss)
 }
 
-// How many ticks this frame owes: its time goes in at the pace the server steers my
-// clock to (game.time_scale), a whole tick comes out per tick, and the rest waits for
-// the next frame. A stall never turns into a burst: at most MAX_FRAME is owed.
+// How many ticks this frame owes: its time goes in, a whole tick comes out per tick,
+// and the rest waits for the next frame. A stall never turns into a burst: at most MAX_FRAME is owed.
 ticks_owed :: proc(dt: f64) -> int {
 	app.seconds += dt
-	app.accumulator = min(app.accumulator + dt * app.game.time_scale, MAX_FRAME)
+	app.accumulator = min(app.accumulator + dt, MAX_FRAME)
 	n := int(app.accumulator / TICK)
 	app.accumulator -= f64(n) * TICK
 	return n
@@ -209,7 +206,6 @@ parse_options :: proc() -> (o: Options, d: Debug) {
 		case "-name":   o.name = next; i += 1
 		case "-window": o.windowed = true
 		case "-headless": o.headless = true
-		case "-interp-ticks": o.interp_ticks = strconv.parse_int(next) or_else 0; i += 1
 		case "-ping":   o.ping, _ = strconv.parse_f64(next); i += 1
 		case "-jitter": o.jitter, _ = strconv.parse_f64(next); i += 1
 		case "-loss":   o.loss, _ = strconv.parse_f64(next); i += 1

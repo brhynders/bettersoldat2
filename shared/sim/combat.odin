@@ -216,6 +216,7 @@ fire_weapon :: proc(ctx: ^Context, w: ^World, index: u8, events: ^Events) {
 	anims := ctx.anims
 	weapon := &s.weapon
 	info := &ctx.weapons[weapon.id]
+	s.bullet_count += 1 // this shot's number: the seed its pellets are rebuilt from elsewhere
 	pose := soldier_pose(anims, s, s.pos)
 
 	aim_dir := info.style == .Knife ? hands_aim_direction(&pose) : vec2_normalize(s.aim - pose[14])
@@ -241,30 +242,30 @@ fire_weapon :: proc(ctx: ^Context, w: ^World, index: u8, events: ^Events) {
 	if _, hit := collision_test(ctx.level, origin); hit do origin.y += 2.5
 
 	spread :: proc(s: ^Soldier, v: Vec2, amount: f32) -> Vec2 {
-		return v + {(rand_f32(&s.rng) * 2 - 1) * amount, (rand_f32(&s.rng) * 2 - 1) * amount}
+		return bullet_spread(&s.rng, v, amount)
 	}
 
 	#partial switch weapon.id {
 	case .Eagle:
-		bullet_spawn(ctx, w, origin, spread(s, vel, info.spread), weapon.id, index, info.damage, events)
+		fire_bullet(ctx, w, origin, spread(s, vel, info.spread), weapon.id, index, info.damage, events)
 		second := spread(s, vel, info.spread)
 		n := vec2_normalize(vel)
 		origin2 := origin + {-math.sign(vel.x) * abs(n.y) * 3, math.sign(vel.y) * abs(n.x) * 3}
-		bullet_spawn(ctx, w, origin2, second, weapon.id, index, info.damage, events)
+		fire_bullet(ctx, w, origin2, second, weapon.id, index, info.damage, events)
 	case .Flamer:
-		bullet_spawn(ctx, w, origin + vel * 3, vel, weapon.id, index, info.damage, events)
+		fire_bullet(ctx, w, origin + vel * 3, vel, weapon.id, index, info.damage, events)
 	case .Chainsaw:
-		bullet_spawn(ctx, w, origin + vel * 2, vel, weapon.id, index, info.damage, events)
+		fire_bullet(ctx, w, origin + vel * 2, vel, weapon.id, index, info.damage, events)
 	case .LAW:
 		if !((s.on_ground || s.on_ground_permanent || s.on_ground_for_law) && law_stance(s)) do return
-		bullet_spawn(ctx, w, origin, vel, weapon.id, index, info.damage, events)
+		fire_bullet(ctx, w, origin, vel, weapon.id, index, info.damage, events)
 	case .None, .Knife:
 	case:
 		if info.style == .Shotgun {
-			for _ in 0 ..< 6 do bullet_spawn(ctx, w, origin, spread(s, vel, info.spread), weapon.id, index, info.damage, events)
+			for _ in 0 ..< 6 do fire_bullet(ctx, w, origin, spread(s, vel, info.spread), weapon.id, index, info.damage, events)
 			s.vel -= vel * {0.0412, 0.041}
 		} else {
-			bullet_spawn(ctx, w, origin, vel, weapon.id, index, info.damage, events)
+			fire_bullet(ctx, w, origin, vel, weapon.id, index, info.damage, events)
 		}
 	}
 
@@ -350,6 +351,12 @@ movement_inaccuracy :: proc(ctx: ^Context, s: ^Soldier) -> f32 {
 	return 0
 }
 
+// A pellet's deviation, from a random number source: the shooter's own, or the shot's
+// seed on the machines that rebuild the pellets from it.
+bullet_spread :: proc(rng: ^u64, v: Vec2, amount: f32) -> Vec2 {
+	return v + {(rand_f32(rng) * 2 - 1) * amount, (rand_f32(rng) * 2 - 1) * amount}
+}
+
 // The grenade: hold to wind up (longer is further), release to throw.
 @(private = "file")
 throw_grenade :: proc(ctx: ^Context, w: ^World, index: u8, events: ^Events) {
@@ -381,7 +388,7 @@ throw_grenade :: proc(ctx: ^Context, w: ^World, index: u8, events: ^Events) {
 		_, in_wall := collision_test(ctx.level, origin)
 		_, blocked := ray_cast(ctx.level, head, origin, 50, {bullet = true, team = s.team})
 		if !in_wall && !blocked {
-			bullet_spawn(ctx, w, origin, vel, .Frag, index, frag.damage, events)
+			fire_bullet(ctx, w, origin, vel, .Frag, index, frag.damage, events)
 			s.grenades -= 1
 			emit(events, Fire{player = index, weapon = .Frag, pos = origin, vel = vel})
 			if frag.bink < 0 do s.hit_spray = calculate_bink(s.hit_spray, int(-frag.bink))

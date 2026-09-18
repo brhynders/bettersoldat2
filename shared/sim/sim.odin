@@ -10,13 +10,15 @@
 //   - Everything else that happened is emitted as an Event too (sounds, sparks,
 //     messages, the pickups, deaths and scores).
 //
-// Who runs what (server authority):
-//   - The server runs the one true world with step() on everyone's commands and
-//     applies the hits (damage_apply). What it sends is the world whole.
-//   - A client rebuilds its world from the newest snapshot every tick, replays its
-//     own pending commands on it (soldier_step, things_update, bullets_update),
-//     which predicts everything they touch, and overwrites everything that is not
-//     its own from the snapshots as it shows them. It applies no wounds.
+// Who runs what (OpenSoldat's model, copied exactly: see shared/net):
+//   - A client steps its own soldier from its keys and tells the server where it is;
+//     the server takes that as the truth. Everyone steps everyone else from the last
+//     keys it heard (dead reckoning), and every bullet it knows of.
+//   - The server alone wounds (damage_apply), kills, respawns, and gives the things.
+//     A client runs the whole hit pipeline for the blood, the sounds and the shove,
+//     but applies no damage; its health comes from the server's snapshots.
+//   - Which machine creates a bullet, and the ping-delayed shove, are World.net's
+//     rules (fire_bullet, soldier_shove).
 //   - Tools and tests run step() on a whole world, which does all of it at once.
 //
 // Files, one per object:
@@ -77,7 +79,16 @@ World :: struct {
 	// never steps them, and their bullets never touch soldiers here (their client
 	// reports the hits).
 	ragdolls: [MAX_PLAYERS]Ragdoll, // the corpses, one per dead soldier
-	history:  ^History, // the server's rewind for judging shots; nil elsewhere
+	history:  ^History, // where everyone was lately, for a client's bullets: they meet the others as their shooter saw them
+	net:      Net_Role,
+}
+
+// Which machine this world runs on, for the rules that differ by it.
+Net_Role :: struct {
+	server:    bool,
+	mine:      bit_set[0 ..< MAX_PLAYERS], // the soldiers this machine plays: a client its own, the server its bots
+	view:      Vec2, // a client's camera midpoint, for which bullets the server would have relayed to it
+	view_half: Vec2, // half the view's width and height
 }
 
 world_init :: proc(w: ^World, seed: u64) {

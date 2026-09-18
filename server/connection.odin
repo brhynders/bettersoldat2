@@ -72,6 +72,15 @@ host_bind :: proc(h: ^Host, slot: u8, peer: ^enet.Peer) {
 	peer.packetThrottle = enet.PEER_PACKET_THROTTLE_SCALE
 }
 
+// A client that stopped answering: disconnected, and gone next tick.
+host_drop :: proc(h: ^Host, slot: u8) {
+	if p := h.peers[slot]; p != nil {
+		enet.peer_disconnect(p, 0)
+		h.peers[slot] = nil
+		append(&h.left, slot)
+	}
+}
+
 slot_of :: proc(h: ^Host, peer: ^enet.Peer) -> int {
 	for p, i in h.peers do if p == peer do return i
 	return NO_SLOT

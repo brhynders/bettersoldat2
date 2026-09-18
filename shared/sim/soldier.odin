@@ -19,7 +19,8 @@ Soldier :: struct {
 	team:   Team,
 	health: f32,
 	dead:   bool,
-	view_lag: u8, // ticks behind the present its client shows the others; its shots inherit it
+	ping_ticks: u8, // its round trip in ticks, as the server measured it (PingTicks)
+	bullet_count: u16, // numbers its shots, from a random start: the seed the others rebuild the pellets from
 	death_vel:  Vec2, // how it died, for the corpse any client starts from this state
 	death_part: u8,
 	rng:      u64, // its own randomness (the spread of its shots), so its client predicts it
@@ -27,7 +28,7 @@ Soldier :: struct {
 	// owned by the client that plays it
 	pos, old_pos:  Vec2,
 	vel, forces:   Vec2, // forces apply on the next integration step
-	next_push:     Vec2, // knockback applied at the start of the next step
+	push:          [PUSH_TICKS]Vec2, // knockback waiting: push[0] lands next step, the rest shift down (NextPush)
 	controls:      Buttons, // this tick's resolved input
 	aim:           Vec2,
 	direction:     i8, // 1 facing right, -1 left
@@ -73,8 +74,10 @@ Soldier :: struct {
 soldier_spawn :: proc(ctx: ^Context, s: ^Soldier, pos: Vec2, team: Team, primary, secondary: Weapon_Id) {
 	kills, deaths, flags := s.kills, s.deaths, s.flags
 	rng := s.rng != 0 ? s.rng : (u64(transmute(u32)pos.x) << 32 | u64(transmute(u32)pos.y)) | 1 // seeded once, from where it first stood
+	bullet_count := s.bullet_count != 0 ? s.bullet_count : u16(rng >> 17) | 1
 	s^ = {
 		rng                = rng,
+		bullet_count       = bullet_count,
 		kills              = kills,
 		deaths             = deaths,
 		flags              = flags,
@@ -128,8 +131,9 @@ soldier_step :: proc(ctx: ^Context, w: ^World, index: u8, cmd: Command, events: 
 	s := &w.soldiers[index]
 	if !s.active || s.dead do return
 	soldier_integrate(s, w.gravity)
-	s.vel += s.next_push
-	s.next_push = {}
+	s.vel += s.push[0]
+	copy(s.push[:PUSH_TICKS - 1], s.push[1:])
+	s.push[PUSH_TICKS - 1] = {}
 	if s.hit_spray > 0 do s.hit_spray -= 1
 
 	// Between rounds nobody moves.
@@ -146,7 +150,7 @@ soldier_step :: proc(ctx: ^Context, w: ^World, index: u8, cmd: Command, events: 
 	level := ctx.level
 	bound := f32(level.sectors_num * level.sectors_division - 50)
 	if abs(s.pos.x) > bound || abs(s.pos.y) > bound {
-		soldier_respawn(ctx, w, index, events)
+		if w.net.server do soldier_respawn(ctx, w, index, events) // a client waits for the server's word
 		return
 	}
 
@@ -159,6 +163,19 @@ soldier_step :: proc(ctx: ^Context, w: ^World, index: u8, cmd: Command, events: 
 	if s.jets < level.start_jet && .Jet not_in s.controls {
 		if s.on_ground || w.tick % 2 == 0 do s.jets += 1
 	}
+}
+
+// A hit's shove, into the victim's queue. On the server it lands next tick. On a client
+// it waits until the bullet is seen to arrive: half the victim's round trip, plus the
+// shooter's as the bullet carries it, plus one (OpenSoldat's PushTick), so the shove
+// is felt about when the shooter saw the hit.
+PUSH_TICKS :: 126 // MAX_PUSHTICK 125, and the one landing now
+
+soldier_shove :: proc(w: ^World, victim: u8, bullet_lag: u8, push: Vec2) {
+	s := &w.soldiers[victim]
+	k := 0
+	if !w.net.server do k = min(int(s.ping_ticks) / 2 + int(bullet_lag) + 1, PUSH_TICKS - 1)
+	s.push[k] += push
 }
 
 // The one thing that ticks on a dead soldier: the countdown to its respawn.
